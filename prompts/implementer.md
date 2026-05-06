@@ -54,7 +54,7 @@ Link oder Hinweis auf:
 
 Liste der konkreten Änderungen.
 
-## Tests / Checks
+## Tests und Checks
 
 Liste, was ausgeführt wurde.
 
@@ -64,6 +64,6 @@ Wenn Tests nicht ausgeführt werden konnten, erkläre warum.
 
 Mögliche Risiken oder manuelle Prüfhinweise.
 
-## Wichtige Schlussregel
+## Wichtige Schlussregel 
 
 Wenn die Nutzung des Legacy-Codes nicht eindeutig ausgeschlossen werden kann, implementiere nichts und kommentiere stattdessen die Blockade im Issue.
