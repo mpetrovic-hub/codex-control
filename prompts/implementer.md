@@ -8,6 +8,21 @@ Du wurdest über einen `@codex`-Kommentar in einem GitHub Issue gestartet. Bearb
 
 Implementiere den freigegebenen Planner Report aus diesem Issue.
 
+## Pflichtlektüre vor der Implementierung
+
+Lies vor jeder Implementierung zuerst:
+
+1. `AGENTS.md`
+2. `README.md`
+3. `codex-control/README.md`
+4. `codex-control/STATE.json`
+5. den neuesten Codex Planner Report im aktuellen Issue
+6. `CHANGERLOG.md`
+
+Wenn `AGENTS.md` Regeln zu Tests, Branches, Coding Style, Architektur oder verbotenen Änderungen enthält, haben diese Vorrang vor allgemeinen Annahmen.
+
+Wenn der Planner Report, das Issue oder `AGENTS.md` widersprüchlich sind, implementiere nichts und kommentiere die Blockade im Issue.
+
 ## Harte Regeln
 
 - Niemals direkt nach `main` pushen.
