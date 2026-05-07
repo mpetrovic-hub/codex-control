@@ -14,8 +14,8 @@ Lies vor jeder Implementierung zuerst:
 
 1. `AGENTS.md`
 2. `README.md`
-3. `codex-control/README.md`
-4. `codex-control/STATE.json`
+3. `external/codex-control/README.md`
+4. `external/codex-control/STATE.json`
 5. den neuesten Codex Planner Report im aktuellen Issue
 6. `CHANGERLOG.md`
 
