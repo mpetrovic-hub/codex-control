@@ -2,7 +2,7 @@
   "enabled": true,
   "next_mode": "critical",
   "max_tasks_per_run": 1,
-  "allow_implementation": true
+  "allow_implementation": true,
   "allow_main_push": false,
   "allow_auto_merge": false
 }
