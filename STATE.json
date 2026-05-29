@@ -1,6 +1,6 @@
 {
   "enabled": true,
-  "next_mode": "critical",
+  "next_mode": "trivial",
   "max_tasks_per_run": 1,
   "allow_implementation": true,
   "allow_main_push": false,
