@@ -17,7 +17,7 @@ import time
 from typing import Any
 
 
-DEFAULT_SCHEDULE_MINUTES = (3, 5, 7, 15, 30, 45, 60, 90, 180, 240)
+DEFAULT_SCHEDULE_MINUTES = (7, 15, 18, 30, 45, 60, 90, 180, 240)
 
 CODEX_SOURCE_HINTS = (
     "chatgpt-codex-connector",
@@ -157,26 +157,45 @@ def normalize(source: str, item: dict[str, Any]) -> dict[str, Any]:
         "url": item.get("html_url") or html.get("href"),
         "path": item.get("path"),
         "line": item.get("line") or item.get("original_line"),
-        "body": str(item.get("body") or "").strip()[:4000],
+        "body": str(item.get("body") or item.get("content") or "").strip()[:4000],
     }
 
 
-def collect(repo: str, pr: int, since: dt.datetime) -> list[dict[str, Any]]:
+def collect(repo: str, pr: int, since: dt.datetime) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     endpoints = (
         ("issue_comment", f"/repos/{repo}/issues/{pr}/comments?per_page=100"),
         ("review_comment", f"/repos/{repo}/pulls/{pr}/comments?per_page=100"),
         ("review", f"/repos/{repo}/pulls/{pr}/reviews?per_page=100"),
+        ("issue_reaction", f"/repos/{repo}/issues/{pr}/reactions?per_page=100"),
     )
     findings: list[dict[str, Any]] = []
+    codex_activity: list[dict[str, Any]] = []
     for source, endpoint in endpoints:
         for item in gh_api(endpoint) or []:
             created = parse_time(item.get("created_at") or item.get("submitted_at"))
             if created is None or created < since:
                 continue
-            if is_codex_source(item) and is_actionable(item):
-                findings.append(normalize(source, item))
+            if not is_codex_source(item):
+                continue
+            normalized = normalize(source, item)
+            codex_activity.append(normalized)
+            if source != "issue_reaction" and is_actionable(item):
+                findings.append(normalized)
     findings.sort(key=lambda item: str(item.get("created_at") or ""))
-    return findings
+    codex_activity.sort(key=lambda item: str(item.get("created_at") or ""))
+    return findings, codex_activity
+
+
+def result_status(result: dict[str, Any]) -> str:
+    if result["findings"]:
+        return "actionable_found"
+    if result.get("last_error"):
+        return "inconclusive_error"
+    if not result.get("completed_schedule", True):
+        return "inconclusive_incomplete_schedule"
+    if not result.get("codex_activity"):
+        return "inconclusive_no_codex_review_activity"
+    return "no_actionable_after_observed_codex_review"
 
 
 def print_report(result: dict[str, Any]) -> None:
@@ -186,10 +205,20 @@ def print_report(result: dict[str, Any]) -> None:
     print()
 
     findings = result["findings"]
+    status = result.get("status") or result_status(result)
     print("## Codex PR Review Poll")
     print()
     if not findings:
-        print("No actionable Codex review feedback was found during the polling window.")
+        if status == "no_actionable_after_observed_codex_review":
+            print("No actionable Codex review feedback was found after the full polling window, and Codex review activity was observed.")
+        elif status == "inconclusive_no_codex_review_activity":
+            print("No actionable Codex review feedback was found, but no Codex review activity was observed. Treat this as inconclusive, not green; Codex review may not have run yet.")
+        elif status == "inconclusive_incomplete_schedule":
+            print("No actionable Codex review feedback was found yet, but the full polling schedule did not complete. Treat this as inconclusive, not green.")
+        elif status == "inconclusive_error":
+            print("No actionable Codex review feedback was found, but polling ended with an API error. Treat this as inconclusive, not green.")
+        else:
+            print("No actionable Codex review feedback was found. Treat this as inconclusive unless the JSON status proves the full schedule completed and Codex review activity was observed.")
         return
 
     print("Actionable Codex review feedback was found:")
@@ -229,6 +258,7 @@ def poll_with_schedule(
     pr_created_at = get_pr_created_at(repo, pr)
     since = pr_created_at - dt.timedelta(seconds=since_seconds_ago)
     findings: list[dict[str, Any]] = []
+    codex_activity: list[dict[str, Any]] = []
     last_error: str | None = None
     polls: list[dict[str, Any]] = []
 
@@ -237,11 +267,12 @@ def poll_with_schedule(
         sleep_until(due_at)
         checked_at = now_utc()
         try:
-            findings = collect(repo, pr, since)
+            findings, codex_activity = collect(repo, pr, since)
             last_error = None
         except Exception as exc:  # noqa: BLE001
             last_error = str(exc)
             findings = []
+            codex_activity = []
 
         polls.append(
             {
@@ -249,23 +280,29 @@ def poll_with_schedule(
                 "due_at": due_at.isoformat(),
                 "checked_at": checked_at.isoformat(),
                 "finding_count": len(findings),
+                "codex_activity_count": len(codex_activity),
                 "error": last_error,
             }
         )
         if findings:
             break
 
-    return {
+    completed_schedule = len(polls) == len(schedule_minutes) and not findings
+    result = {
         "repo": repo,
         "pr": pr,
         "started_at": started_at.isoformat(),
         "pr_created_at": pr_created_at.isoformat(),
         "since": since.isoformat(),
         "schedule_minutes": schedule_minutes,
+        "completed_schedule": completed_schedule,
         "polls": polls,
         "last_error": last_error,
+        "codex_activity": codex_activity,
         "findings": findings,
     }
+    result["status"] = result_status(result)
+    return result
 
 
 def poll_with_timeout(
@@ -279,13 +316,14 @@ def poll_with_timeout(
     since = started_at - dt.timedelta(seconds=since_seconds_ago)
     deadline = started_at + dt.timedelta(minutes=timeout_minutes)
     findings: list[dict[str, Any]] = []
+    codex_activity: list[dict[str, Any]] = []
     last_error: str | None = None
     polls: list[dict[str, Any]] = []
 
     while now_utc() <= deadline:
         checked_at = now_utc()
         try:
-            findings = collect(repo, pr, since)
+            findings, codex_activity = collect(repo, pr, since)
             last_error = None
         except Exception as exc:  # noqa: BLE001
             last_error = str(exc)
@@ -294,6 +332,7 @@ def poll_with_timeout(
             {
                 "checked_at": checked_at.isoformat(),
                 "finding_count": len(findings),
+                "codex_activity_count": len(codex_activity),
                 "error": last_error,
             }
         )
@@ -305,17 +344,22 @@ def poll_with_timeout(
             break
         time.sleep(min(interval_seconds, remaining))
 
-    return {
+    completed_schedule = now_utc() >= deadline and not findings
+    result = {
         "repo": repo,
         "pr": pr,
         "started_at": started_at.isoformat(),
         "since": since.isoformat(),
         "timeout_minutes": timeout_minutes,
         "interval_seconds": interval_seconds,
+        "completed_schedule": completed_schedule,
         "polls": polls,
         "last_error": last_error,
+        "codex_activity": codex_activity,
         "findings": findings,
     }
+    result["status"] = result_status(result)
+    return result
 
 
 def main() -> int:
@@ -325,7 +369,7 @@ def main() -> int:
     parser.add_argument("--pr", required=True, help="PR number, PR URL, or owner/repo#number")
     parser.add_argument(
         "--schedule-minutes",
-        help="Comma-separated PR-age minutes to poll at. Default: 3,5,7,15,30,45,60,90,180,240.",
+        help="Comma-separated PR-age minutes to poll at. Default: 7,15,18,30,45,60,90,180,240.",
     )
     parser.add_argument("--timeout-minutes", type=float)
     parser.add_argument("--interval-seconds", type=float, default=60.0)
