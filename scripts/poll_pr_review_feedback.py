@@ -89,12 +89,70 @@ def gh_api(path: str) -> Any:
     return json.loads(proc.stdout or "null")
 
 
+def gh_graphql(query: str, **fields: object) -> Any:
+    cmd = ["gh", "api", "graphql", "-f", f"query={query}"]
+    for key, value in fields.items():
+        cmd.extend(["-F", f"{key}={value}"])
+    proc = subprocess.run(
+        cmd,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or "graphql"
+        raise RuntimeError(f"gh api graphql failed: {detail}")
+    return json.loads(proc.stdout or "null")
+
+
 def get_pr_created_at(repo: str, pr: int) -> dt.datetime:
     pr_data = gh_api(f"/repos/{repo}/pulls/{pr}")
     created = parse_time(pr_data.get("created_at"))
     if created is None:
         raise RuntimeError(f"Could not read created_at for PR #{pr}")
     return created
+
+
+def get_pr_review_context(repo: str, pr: int) -> dict[str, Any]:
+    owner, name = repo.split("/", 1)
+    query = """
+    query($owner: String!, $name: String!, $number: Int!) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $number) {
+          headRefOid
+          reviewThreads(first: 100) {
+            nodes {
+              isResolved
+              isOutdated
+              comments(first: 50) {
+                nodes {
+                  databaseId
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+    data = gh_graphql(query, owner=owner, name=name, number=pr)
+    pull = (((data.get("data") or {}).get("repository") or {}).get("pullRequest") or {})
+    comment_threads: dict[int, dict[str, bool]] = {}
+    for thread in (((pull.get("reviewThreads") or {}).get("nodes")) or []):
+        state = {
+            "is_resolved": bool(thread.get("isResolved")),
+            "is_outdated": bool(thread.get("isOutdated")),
+        }
+        for comment in (((thread.get("comments") or {}).get("nodes")) or []):
+            database_id = comment.get("databaseId")
+            if database_id is not None:
+                comment_threads[int(database_id)] = state
+    return {
+        "head_sha": pull.get("headRefOid"),
+        "comment_threads": comment_threads,
+    }
 
 
 def parse_schedule_minutes(value: str | None) -> list[float]:
@@ -161,7 +219,26 @@ def normalize(source: str, item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def should_skip_stale_item(source: str, item: dict[str, Any], review_context: dict[str, Any]) -> bool:
+    head_sha = review_context.get("head_sha")
+    commit_id = item.get("commit_id")
+    if source == "review":
+        return bool(head_sha and commit_id and commit_id != head_sha)
+
+    if source == "review_comment":
+        if head_sha and commit_id and commit_id != head_sha:
+            return True
+        thread_state = (review_context.get("comment_threads") or {}).get(int(item.get("id") or 0))
+        if thread_state and (thread_state.get("is_resolved") or thread_state.get("is_outdated")):
+            return True
+        if item.get("line") is None:
+            return True
+
+    return False
+
+
 def collect(repo: str, pr: int, since: dt.datetime) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    review_context = get_pr_review_context(repo, pr)
     endpoints = (
         ("issue_comment", f"/repos/{repo}/issues/{pr}/comments?per_page=100"),
         ("review_comment", f"/repos/{repo}/pulls/{pr}/comments?per_page=100"),
@@ -177,9 +254,11 @@ def collect(repo: str, pr: int, since: dt.datetime) -> tuple[list[dict[str, Any]
                 continue
             if not is_codex_source(item):
                 continue
+            if should_skip_stale_item(source, item, review_context):
+                continue
             normalized = normalize(source, item)
             codex_activity.append(normalized)
-            if source != "issue_reaction" and is_actionable(item):
+            if source not in {"issue_reaction", "review"} and is_actionable(item):
                 findings.append(normalized)
     findings.sort(key=lambda item: str(item.get("created_at") or ""))
     codex_activity.sort(key=lambda item: str(item.get("created_at") or ""))
