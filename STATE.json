@@ -1,9 +1,10 @@
 {
   "enabled": true,
-  "next_mode": "trivial",
+  "next_mode": "critical",
   "max_tasks_per_run": 1,
   "allow_implementation": true,
   "allow_main_push": false,
   "allow_auto_merge": false,
-  "active_parent_issue": null
+  "active_parent_issue": null,
+  "implementer_last_pick": null
 }
