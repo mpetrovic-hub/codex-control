@@ -200,6 +200,14 @@ def is_actionable(item: dict[str, Any]) -> bool:
     return any(hint in text for hint in CODEX_SUGGESTION_HINTS)
 
 
+def has_clean_approval_signal(codex_activity: list[dict[str, Any]]) -> bool:
+    """A Codex thumbs-up means its review completed without a finding."""
+    return any(
+        item.get("source") == "issue_reaction" and item.get("body") == "+1"
+        for item in codex_activity
+    )
+
+
 def normalize(source: str, item: dict[str, Any]) -> dict[str, Any]:
     user = item.get("user") or {}
     app = item.get("app") or {}
@@ -270,6 +278,8 @@ def result_status(result: dict[str, Any]) -> str:
         return "actionable_found"
     if result.get("last_error"):
         return "inconclusive_error"
+    if result.get("clean_approval_observed"):
+        return "no_actionable_after_observed_codex_review"
     if not result.get("completed_schedule", True):
         return "inconclusive_incomplete_schedule"
     if not result.get("codex_activity"):
@@ -289,7 +299,10 @@ def print_report(result: dict[str, Any]) -> None:
     print()
     if not findings:
         if status == "no_actionable_after_observed_codex_review":
-            print("No actionable Codex review feedback was found after the full polling window, and Codex review activity was observed.")
+            if result.get("clean_approval_observed"):
+                print("Codex reacted with a thumbs-up and no actionable review feedback was found. Polling ended early as clean.")
+            else:
+                print("No actionable Codex review feedback was found after the full polling window, and Codex review activity was observed.")
         elif status == "inconclusive_no_codex_review_activity":
             print("No actionable Codex review feedback was found, but no Codex review activity was observed. Treat this as inconclusive, not green; Codex review may not have run yet.")
         elif status == "inconclusive_incomplete_schedule":
@@ -340,6 +353,7 @@ def poll_with_schedule(
     codex_activity: list[dict[str, Any]] = []
     last_error: str | None = None
     polls: list[dict[str, Any]] = []
+    clean_approval_observed = False
 
     for minute in schedule_minutes:
         due_at = pr_created_at + dt.timedelta(minutes=minute)
@@ -363,7 +377,10 @@ def poll_with_schedule(
                 "error": last_error,
             }
         )
+        clean_approval_observed = has_clean_approval_signal(codex_activity)
         if findings:
+            break
+        if clean_approval_observed:
             break
 
     completed_schedule = len(polls) == len(schedule_minutes) and not findings
@@ -377,6 +394,7 @@ def poll_with_schedule(
         "completed_schedule": completed_schedule,
         "polls": polls,
         "last_error": last_error,
+        "clean_approval_observed": clean_approval_observed,
         "codex_activity": codex_activity,
         "findings": findings,
     }
@@ -398,6 +416,7 @@ def poll_with_timeout(
     codex_activity: list[dict[str, Any]] = []
     last_error: str | None = None
     polls: list[dict[str, Any]] = []
+    clean_approval_observed = False
 
     while now_utc() <= deadline:
         checked_at = now_utc()
@@ -415,7 +434,10 @@ def poll_with_timeout(
                 "error": last_error,
             }
         )
+        clean_approval_observed = has_clean_approval_signal(codex_activity)
         if findings:
+            break
+        if clean_approval_observed:
             break
 
         remaining = (deadline - now_utc()).total_seconds()
@@ -434,6 +456,7 @@ def poll_with_timeout(
         "completed_schedule": completed_schedule,
         "polls": polls,
         "last_error": last_error,
+        "clean_approval_observed": clean_approval_observed,
         "codex_activity": codex_activity,
         "findings": findings,
     }
