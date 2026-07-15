@@ -107,14 +107,6 @@ def gh_graphql(query: str, **fields: object) -> Any:
     return json.loads(proc.stdout or "null")
 
 
-def get_pr_created_at(repo: str, pr: int) -> dt.datetime:
-    pr_data = gh_api(f"/repos/{repo}/pulls/{pr}")
-    created = parse_time(pr_data.get("created_at"))
-    if created is None:
-        raise RuntimeError(f"Could not read created_at for PR #{pr}")
-    return created
-
-
 def get_pr_review_context(repo: str, pr: int) -> dict[str, Any]:
     owner, name = repo.split("/", 1)
     query = """
@@ -229,12 +221,15 @@ def normalize(source: str, item: dict[str, Any]) -> dict[str, Any]:
 
 def should_skip_stale_item(source: str, item: dict[str, Any], review_context: dict[str, Any]) -> bool:
     head_sha = review_context.get("head_sha")
-    commit_id = item.get("commit_id")
     if source == "review":
+        commit_id = item.get("commit_id")
         return bool(head_sha and commit_id and commit_id != head_sha)
 
     if source == "review_comment":
-        if head_sha and commit_id and commit_id != head_sha:
+        # GitHub can move commit_id forward when the original line still maps to
+        # the new head. original_commit_id preserves which code was reviewed.
+        reviewed_commit_id = item.get("original_commit_id") or item.get("commit_id")
+        if head_sha and reviewed_commit_id and reviewed_commit_id != head_sha:
             return True
         thread_state = (review_context.get("comment_threads") or {}).get(int(item.get("id") or 0))
         if thread_state and (thread_state.get("is_resolved") or thread_state.get("is_outdated")):
@@ -245,7 +240,12 @@ def should_skip_stale_item(source: str, item: dict[str, Any], review_context: di
     return False
 
 
-def collect(repo: str, pr: int, since: dt.datetime) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def collect(
+    repo: str,
+    pr: int,
+    since: dt.datetime,
+    unbound_since: dt.datetime | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None]:
     review_context = get_pr_review_context(repo, pr)
     endpoints = (
         ("issue_comment", f"/repos/{repo}/issues/{pr}/comments?per_page=100"),
@@ -260,6 +260,10 @@ def collect(repo: str, pr: int, since: dt.datetime) -> tuple[list[dict[str, Any]
             created = parse_time(item.get("created_at") or item.get("submitted_at"))
             if created is None or created < since:
                 continue
+            # Issue comments and reactions do not identify a reviewed commit.
+            # Do not let activity from a previous head's cycle cross a restart.
+            if source in {"issue_comment", "issue_reaction"} and unbound_since and created < unbound_since:
+                continue
             if not is_codex_source(item):
                 continue
             if should_skip_stale_item(source, item, review_context):
@@ -270,7 +274,7 @@ def collect(repo: str, pr: int, since: dt.datetime) -> tuple[list[dict[str, Any]
                 findings.append(normalized)
     findings.sort(key=lambda item: str(item.get("created_at") or ""))
     codex_activity.sort(key=lambda item: str(item.get("created_at") or ""))
-    return findings, codex_activity
+    return findings, codex_activity, review_context.get("head_sha")
 
 
 def result_status(result: dict[str, Any]) -> str:
@@ -347,40 +351,66 @@ def poll_with_schedule(
     since_seconds_ago: float,
 ) -> dict[str, Any]:
     started_at = now_utc()
-    pr_created_at = get_pr_created_at(repo, pr)
-    since = pr_created_at - dt.timedelta(seconds=since_seconds_ago)
-    findings: list[dict[str, Any]] = []
-    codex_activity: list[dict[str, Any]] = []
-    last_error: str | None = None
-    polls: list[dict[str, Any]] = []
-    clean_approval_observed = False
+    head_restarts: list[dict[str, Any]] = []
 
-    for minute in schedule_minutes:
-        due_at = pr_created_at + dt.timedelta(minutes=minute)
-        sleep_until(due_at)
-        checked_at = now_utc()
-        try:
-            findings, codex_activity = collect(repo, pr, since)
-            last_error = None
-        except Exception as exc:  # noqa: BLE001
-            last_error = str(exc)
-            findings = []
-            codex_activity = []
+    while True:
+        cycle_started_at = now_utc()
+        cycle_head_sha = get_pr_review_context(repo, pr).get("head_sha")
+        if not cycle_head_sha:
+            raise RuntimeError(f"Could not read head SHA for PR #{pr}")
+        since = cycle_started_at - dt.timedelta(seconds=since_seconds_ago)
+        findings: list[dict[str, Any]] = []
+        codex_activity: list[dict[str, Any]] = []
+        last_error: str | None = None
+        polls: list[dict[str, Any]] = []
+        clean_approval_observed = False
+        restart_for_new_head = False
 
-        polls.append(
-            {
-                "minute": minute,
-                "due_at": due_at.isoformat(),
-                "checked_at": checked_at.isoformat(),
-                "finding_count": len(findings),
-                "codex_activity_count": len(codex_activity),
-                "error": last_error,
-            }
-        )
-        clean_approval_observed = has_clean_approval_signal(codex_activity)
-        if findings:
-            break
-        if clean_approval_observed:
+        for minute in schedule_minutes:
+            due_at = cycle_started_at + dt.timedelta(minutes=minute)
+            sleep_until(due_at)
+            checked_at = now_utc()
+            observed_head_sha: str | None = None
+            try:
+                findings, codex_activity, observed_head_sha = collect(
+                    repo,
+                    pr,
+                    since,
+                    unbound_since=cycle_started_at,
+                )
+                last_error = None
+            except Exception as exc:  # noqa: BLE001
+                last_error = str(exc)
+                findings = []
+                codex_activity = []
+
+            polls.append(
+                {
+                    "minute": minute,
+                    "due_at": due_at.isoformat(),
+                    "checked_at": checked_at.isoformat(),
+                    "head_sha": observed_head_sha,
+                    "finding_count": len(findings),
+                    "codex_activity_count": len(codex_activity),
+                    "error": last_error,
+                }
+            )
+            if observed_head_sha and observed_head_sha != cycle_head_sha:
+                head_restarts.append(
+                    {
+                        "detected_at": checked_at.isoformat(),
+                        "previous_head_sha": cycle_head_sha,
+                        "new_head_sha": observed_head_sha,
+                    }
+                )
+                restart_for_new_head = True
+                break
+
+            clean_approval_observed = has_clean_approval_signal(codex_activity)
+            if findings or clean_approval_observed:
+                break
+
+        if not restart_for_new_head:
             break
 
     completed_schedule = len(polls) == len(schedule_minutes) and not findings
@@ -388,7 +418,10 @@ def poll_with_schedule(
         "repo": repo,
         "pr": pr,
         "started_at": started_at.isoformat(),
-        "pr_created_at": pr_created_at.isoformat(),
+        "poll_anchor": "head_cycle_started_at",
+        "cycle_started_at": cycle_started_at.isoformat(),
+        "head_sha": cycle_head_sha,
+        "head_restarts": head_restarts,
         "since": since.isoformat(),
         "schedule_minutes": schedule_minutes,
         "completed_schedule": completed_schedule,
@@ -410,46 +443,77 @@ def poll_with_timeout(
     since_seconds_ago: float,
 ) -> dict[str, Any]:
     started_at = now_utc()
-    since = started_at - dt.timedelta(seconds=since_seconds_ago)
-    deadline = started_at + dt.timedelta(minutes=timeout_minutes)
-    findings: list[dict[str, Any]] = []
-    codex_activity: list[dict[str, Any]] = []
-    last_error: str | None = None
-    polls: list[dict[str, Any]] = []
-    clean_approval_observed = False
+    head_restarts: list[dict[str, Any]] = []
 
-    while now_utc() <= deadline:
-        checked_at = now_utc()
-        try:
-            findings, codex_activity = collect(repo, pr, since)
-            last_error = None
-        except Exception as exc:  # noqa: BLE001
-            last_error = str(exc)
+    while True:
+        cycle_started_at = now_utc()
+        cycle_head_sha = get_pr_review_context(repo, pr).get("head_sha")
+        if not cycle_head_sha:
+            raise RuntimeError(f"Could not read head SHA for PR #{pr}")
+        since = cycle_started_at - dt.timedelta(seconds=since_seconds_ago)
+        deadline = cycle_started_at + dt.timedelta(minutes=timeout_minutes)
+        findings: list[dict[str, Any]] = []
+        codex_activity: list[dict[str, Any]] = []
+        last_error: str | None = None
+        polls: list[dict[str, Any]] = []
+        clean_approval_observed = False
+        restart_for_new_head = False
 
-        polls.append(
-            {
-                "checked_at": checked_at.isoformat(),
-                "finding_count": len(findings),
-                "codex_activity_count": len(codex_activity),
-                "error": last_error,
-            }
-        )
-        clean_approval_observed = has_clean_approval_signal(codex_activity)
-        if findings:
-            break
-        if clean_approval_observed:
-            break
+        while now_utc() <= deadline:
+            checked_at = now_utc()
+            observed_head_sha: str | None = None
+            try:
+                findings, codex_activity, observed_head_sha = collect(
+                    repo,
+                    pr,
+                    since,
+                    unbound_since=cycle_started_at,
+                )
+                last_error = None
+            except Exception as exc:  # noqa: BLE001
+                last_error = str(exc)
 
-        remaining = (deadline - now_utc()).total_seconds()
-        if remaining <= 0:
+            polls.append(
+                {
+                    "checked_at": checked_at.isoformat(),
+                    "head_sha": observed_head_sha,
+                    "finding_count": len(findings),
+                    "codex_activity_count": len(codex_activity),
+                    "error": last_error,
+                }
+            )
+            if observed_head_sha and observed_head_sha != cycle_head_sha:
+                head_restarts.append(
+                    {
+                        "detected_at": checked_at.isoformat(),
+                        "previous_head_sha": cycle_head_sha,
+                        "new_head_sha": observed_head_sha,
+                    }
+                )
+                restart_for_new_head = True
+                break
+
+            clean_approval_observed = has_clean_approval_signal(codex_activity)
+            if findings or clean_approval_observed:
+                break
+
+            remaining = (deadline - now_utc()).total_seconds()
+            if remaining <= 0:
+                break
+            time.sleep(min(interval_seconds, remaining))
+
+        if not restart_for_new_head:
             break
-        time.sleep(min(interval_seconds, remaining))
 
     completed_schedule = now_utc() >= deadline and not findings
     result = {
         "repo": repo,
         "pr": pr,
         "started_at": started_at.isoformat(),
+        "poll_anchor": "head_cycle_started_at",
+        "cycle_started_at": cycle_started_at.isoformat(),
+        "head_sha": cycle_head_sha,
+        "head_restarts": head_restarts,
         "since": since.isoformat(),
         "timeout_minutes": timeout_minutes,
         "interval_seconds": interval_seconds,
@@ -471,7 +535,7 @@ def main() -> int:
     parser.add_argument("--pr", required=True, help="PR number, PR URL, or owner/repo#number")
     parser.add_argument(
         "--schedule-minutes",
-        help="Comma-separated PR-age minutes to poll at. Default: 7,15,18,30,45,60,90,180,240.",
+        help="Comma-separated minutes after the current-head polling cycle starts. Default: 7,15,18,30,45,60,90,180,240.",
     )
     parser.add_argument("--timeout-minutes", type=float)
     parser.add_argument("--interval-seconds", type=float, default=60.0)
