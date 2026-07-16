@@ -244,6 +244,7 @@ def collect(
     repo: str,
     pr: int,
     since: dt.datetime,
+    unbound_since: dt.datetime | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None]:
     review_context = get_pr_review_context(repo, pr)
     endpoints = (
@@ -258,6 +259,10 @@ def collect(
         for item in gh_api(endpoint) or []:
             created = parse_time(item.get("created_at") or item.get("submitted_at"))
             if created is None or created < since:
+                continue
+            # Issue comments and reactions cannot be tied to a head SHA. After
+            # a head restart, accept only those observed in the new safe window.
+            if source in {"issue_comment", "issue_reaction"} and unbound_since and created < unbound_since:
                 continue
             if not is_codex_source(item):
                 continue
@@ -349,6 +354,7 @@ def poll_with_schedule(
     # Keep one observation window across head-cycle restarts. The schedule is
     # reset per head, but feedback already fetched for the new head must survive.
     since = started_at - dt.timedelta(seconds=since_seconds_ago)
+    unbound_since = since
     head_restarts: list[dict[str, Any]] = []
     carried_head_sha: str | None = None
     carried_findings: list[dict[str, Any]] = []
@@ -386,6 +392,7 @@ def poll_with_schedule(
                     repo,
                     pr,
                     since,
+                    unbound_since=unbound_since,
                 )
                 last_error = None
             except Exception as exc:  # noqa: BLE001
@@ -405,18 +412,26 @@ def poll_with_schedule(
                 }
             )
             if observed_head_sha and observed_head_sha != cycle_head_sha:
+                detected_at = now_utc()
                 head_restarts.append(
                     {
-                        "detected_at": checked_at.isoformat(),
+                        "detected_at": detected_at.isoformat(),
                         "previous_head_sha": cycle_head_sha,
                         "new_head_sha": observed_head_sha,
                     }
                 )
-                # collect() used the observed new head for filtering, so carry
-                # its valid results into that head's restarted schedule.
+                # Only commit-bound activity can safely cross a head boundary.
+                # PR-level comments/reactions might belong to the previous head.
                 carried_head_sha = observed_head_sha
-                carried_findings = findings
-                carried_activity = codex_activity
+                carried_findings = [
+                    item for item in findings if item.get("source") == "review_comment"
+                ]
+                carried_activity = [
+                    item
+                    for item in codex_activity
+                    if item.get("source") in {"review", "review_comment"}
+                ]
+                unbound_since = detected_at
                 restart_for_new_head = True
                 break
 
@@ -459,6 +474,7 @@ def poll_with_timeout(
     started_at = now_utc()
     # Timeout cycles use the same persistent observation window as schedules.
     since = started_at - dt.timedelta(seconds=since_seconds_ago)
+    unbound_since = since
     head_restarts: list[dict[str, Any]] = []
     carried_head_sha: str | None = None
     carried_findings: list[dict[str, Any]] = []
@@ -495,6 +511,7 @@ def poll_with_timeout(
                     repo,
                     pr,
                     since,
+                    unbound_since=unbound_since,
                 )
                 last_error = None
             except Exception as exc:  # noqa: BLE001
@@ -510,17 +527,25 @@ def poll_with_timeout(
                 }
             )
             if observed_head_sha and observed_head_sha != cycle_head_sha:
+                detected_at = now_utc()
                 head_restarts.append(
                     {
-                        "detected_at": checked_at.isoformat(),
+                        "detected_at": detected_at.isoformat(),
                         "previous_head_sha": cycle_head_sha,
                         "new_head_sha": observed_head_sha,
                     }
                 )
-                # Preserve feedback already filtered against the observed head.
+                # Preserve only feedback with an explicit reviewed commit.
                 carried_head_sha = observed_head_sha
-                carried_findings = findings
-                carried_activity = codex_activity
+                carried_findings = [
+                    item for item in findings if item.get("source") == "review_comment"
+                ]
+                carried_activity = [
+                    item
+                    for item in codex_activity
+                    if item.get("source") in {"review", "review_comment"}
+                ]
+                unbound_since = detected_at
                 restart_for_new_head = True
                 break
 

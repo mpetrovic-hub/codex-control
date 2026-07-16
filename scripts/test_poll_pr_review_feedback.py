@@ -79,23 +79,60 @@ class HeadCycleTests(unittest.TestCase):
         self.assertEqual("actionable_found", result["status"])
         self.assertEqual(1, collect.call_count)
 
-    def test_current_head_clean_signal_survives_restart(self) -> None:
+    def test_current_head_review_activity_survives_restart(self) -> None:
         base = dt.datetime(2026, 7, 15, 20, 0, tzinfo=dt.timezone.utc)
         contexts = iter(({"head_sha": "old"}, {"head_sha": "new"}))
-        approval = {"source": "issue_reaction", "body": "+1"}
+        review = {"source": "review", "id": 11}
+        collect_results = iter((([], [review], "new"), ([], [review], "new")))
 
         with (
             mock.patch.object(poller, "now_utc", return_value=base),
             mock.patch.object(poller, "get_pr_review_context", side_effect=lambda *_: next(contexts)),
-            mock.patch.object(poller, "collect", return_value=([], [approval], "new")) as collect,
+            mock.patch.object(poller, "collect", side_effect=lambda *_, **__: next(collect_results)) as collect,
             mock.patch.object(poller, "sleep_until"),
         ):
             result = poller.poll_with_schedule("owner/repo", 1, [7], 90)
 
         self.assertEqual("new", result["head_sha"])
-        self.assertTrue(result["clean_approval_observed"])
+        self.assertEqual([review], result["codex_activity"])
         self.assertEqual("no_actionable_after_observed_codex_review", result["status"])
-        self.assertEqual(1, collect.call_count)
+        self.assertEqual(2, collect.call_count)
+
+    def test_unbound_clean_signal_does_not_cross_head_restart(self) -> None:
+        base = dt.datetime(2026, 7, 15, 20, 0, tzinfo=dt.timezone.utc)
+        contexts = iter(({"head_sha": "old"}, {"head_sha": "new"}))
+        approval = {"source": "issue_reaction", "body": "+1"}
+        collect_results = iter((([], [approval], "new"), ([], [], "new")))
+
+        with (
+            mock.patch.object(poller, "now_utc", return_value=base),
+            mock.patch.object(poller, "get_pr_review_context", side_effect=lambda *_: next(contexts)),
+            mock.patch.object(poller, "collect", side_effect=lambda *_, **__: next(collect_results)) as collect,
+            mock.patch.object(poller, "sleep_until"),
+        ):
+            result = poller.poll_with_schedule("owner/repo", 1, [7], 90)
+
+        self.assertEqual("new", result["head_sha"])
+        self.assertFalse(result["clean_approval_observed"])
+        self.assertEqual("inconclusive_no_codex_review_activity", result["status"])
+        self.assertEqual(2, collect.call_count)
+
+    def test_timeout_does_not_carry_unbound_clean_signal_across_restart(self) -> None:
+        base = dt.datetime(2026, 7, 15, 20, 0, tzinfo=dt.timezone.utc)
+        contexts = iter(({"head_sha": "old"}, {"head_sha": "new"}))
+        approval = {"source": "issue_reaction", "body": "+1"}
+        collect_results = iter((([], [approval], "new"), ([], [], "new")))
+
+        with (
+            mock.patch.object(poller, "now_utc", return_value=base),
+            mock.patch.object(poller, "get_pr_review_context", side_effect=lambda *_: next(contexts)),
+            mock.patch.object(poller, "collect", side_effect=lambda *_, **__: next(collect_results)),
+        ):
+            result = poller.poll_with_timeout("owner/repo", 1, 0, 1, 90)
+
+        self.assertEqual("new", result["head_sha"])
+        self.assertFalse(result["clean_approval_observed"])
+        self.assertEqual("inconclusive_no_codex_review_activity", result["status"])
 
     def test_schedule_is_anchored_to_invocation_cycle(self) -> None:
         base = dt.datetime(2026, 7, 15, 20, 0, tzinfo=dt.timezone.utc)
@@ -137,10 +174,40 @@ class UnboundActivityTests(unittest.TestCase):
                 "owner/repo",
                 1,
                 cycle_started - dt.timedelta(seconds=90),
+                unbound_since=cycle_started - dt.timedelta(seconds=90),
             )
 
         self.assertEqual(1, len(activity))
         self.assertEqual("+1", activity[0]["body"])
+
+    def test_reaction_before_restarted_unbound_window_is_ignored(self) -> None:
+        restarted_at = dt.datetime(2026, 7, 15, 20, 7, tzinfo=dt.timezone.utc)
+        reaction = {
+            "id": 4,
+            "content": "+1",
+            "created_at": (restarted_at - dt.timedelta(seconds=1)).isoformat(),
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+        }
+
+        def api(endpoint: str):
+            return [reaction] if endpoint.endswith("reactions?per_page=100") else []
+
+        with (
+            mock.patch.object(
+                poller,
+                "get_pr_review_context",
+                return_value={"head_sha": "new", "comment_threads": {}},
+            ),
+            mock.patch.object(poller, "gh_api", side_effect=api),
+        ):
+            _, activity, _ = poller.collect(
+                "owner/repo",
+                1,
+                restarted_at - dt.timedelta(minutes=7),
+                unbound_since=restarted_at,
+            )
+
+        self.assertEqual([], activity)
 
 
 if __name__ == "__main__":
