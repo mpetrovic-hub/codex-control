@@ -260,8 +260,11 @@ def collect(
     pr: int,
     since: dt.datetime,
     unbound_since: dt.datetime | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str, str]:
     review_context = get_pr_review_context(repo, pr)
+    head_sha_before = review_context.get("head_sha")
+    if not head_sha_before:
+        raise RuntimeError(f"Could not read head SHA for PR #{pr} before collecting feedback")
     endpoints = (
         ("issue_comment", f"/repos/{repo}/issues/{pr}/comments?per_page=100"),
         ("review_comment", f"/repos/{repo}/pulls/{pr}/comments?per_page=100"),
@@ -289,7 +292,10 @@ def collect(
                 findings.append(normalized)
     findings.sort(key=lambda item: str(item.get("created_at") or ""))
     codex_activity.sort(key=lambda item: str(item.get("created_at") or ""))
-    return findings, codex_activity, review_context.get("head_sha")
+    head_sha_after = get_pr_review_context(repo, pr).get("head_sha")
+    if not head_sha_after:
+        raise RuntimeError(f"Could not read head SHA for PR #{pr} after collecting feedback")
+    return findings, codex_activity, head_sha_before, head_sha_after
 
 
 def result_status(result: dict[str, Any]) -> str:
@@ -401,9 +407,10 @@ def poll_with_schedule(
             due_at = cycle_started_at + dt.timedelta(minutes=minute)
             sleep_until(due_at)
             checked_at = now_utc()
+            head_sha_before: str | None = None
             observed_head_sha: str | None = None
             try:
-                findings, codex_activity, observed_head_sha = collect(
+                findings, codex_activity, head_sha_before, observed_head_sha = collect(
                     repo,
                     pr,
                     since,
@@ -420,13 +427,21 @@ def poll_with_schedule(
                     "minute": minute,
                     "due_at": due_at.isoformat(),
                     "checked_at": checked_at.isoformat(),
+                    "head_sha_before": head_sha_before,
                     "head_sha": observed_head_sha,
                     "finding_count": len(findings),
                     "codex_activity_count": len(codex_activity),
                     "error": last_error,
                 }
             )
-            if observed_head_sha and observed_head_sha != cycle_head_sha:
+            head_changed_during_collect = bool(
+                head_sha_before
+                and observed_head_sha
+                and head_sha_before != observed_head_sha
+            )
+            if observed_head_sha and (
+                head_changed_during_collect or observed_head_sha != cycle_head_sha
+            ):
                 detected_at = now_utc()
                 head_restarts.append(
                     {
@@ -438,10 +453,14 @@ def poll_with_schedule(
                 # Preserve every observed actionable finding, including a
                 # top-level issue comment, but never carry an unbound clean +1.
                 carried_head_sha = observed_head_sha
-                carried_findings, carried_activity = carry_feedback_to_new_head(
-                    findings,
-                    codex_activity,
-                )
+                if head_changed_during_collect:
+                    carried_findings = []
+                    carried_activity = []
+                else:
+                    carried_findings, carried_activity = carry_feedback_to_new_head(
+                        findings,
+                        codex_activity,
+                    )
                 unbound_since = detected_at
                 restart_for_new_head = True
                 break
@@ -516,9 +535,10 @@ def poll_with_timeout(
 
         while now_utc() <= deadline:
             checked_at = now_utc()
+            head_sha_before: str | None = None
             observed_head_sha: str | None = None
             try:
-                findings, codex_activity, observed_head_sha = collect(
+                findings, codex_activity, head_sha_before, observed_head_sha = collect(
                     repo,
                     pr,
                     since,
@@ -531,13 +551,21 @@ def poll_with_timeout(
             polls.append(
                 {
                     "checked_at": checked_at.isoformat(),
+                    "head_sha_before": head_sha_before,
                     "head_sha": observed_head_sha,
                     "finding_count": len(findings),
                     "codex_activity_count": len(codex_activity),
                     "error": last_error,
                 }
             )
-            if observed_head_sha and observed_head_sha != cycle_head_sha:
+            head_changed_during_collect = bool(
+                head_sha_before
+                and observed_head_sha
+                and head_sha_before != observed_head_sha
+            )
+            if observed_head_sha and (
+                head_changed_during_collect or observed_head_sha != cycle_head_sha
+            ):
                 detected_at = now_utc()
                 head_restarts.append(
                     {
@@ -548,10 +576,14 @@ def poll_with_timeout(
                 )
                 # Preserve actionable feedback, but not an unbound clean +1.
                 carried_head_sha = observed_head_sha
-                carried_findings, carried_activity = carry_feedback_to_new_head(
-                    findings,
-                    codex_activity,
-                )
+                if head_changed_during_collect:
+                    carried_findings = []
+                    carried_activity = []
+                else:
+                    carried_findings, carried_activity = carry_feedback_to_new_head(
+                        findings,
+                        codex_activity,
+                    )
                 unbound_since = detected_at
                 restart_for_new_head = True
                 break

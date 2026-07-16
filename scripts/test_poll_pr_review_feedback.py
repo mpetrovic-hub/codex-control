@@ -45,7 +45,7 @@ class HeadCycleTests(unittest.TestCase):
     def test_schedule_restarts_when_head_changes(self) -> None:
         base = dt.datetime(2026, 7, 15, 20, 0, tzinfo=dt.timezone.utc)
         contexts = iter(({"head_sha": "old"}, {"head_sha": "new"}))
-        collect_results = iter((([], [], "new"), ([], [{"source": "review"}], "new")))
+        collect_results = iter((([], [], "new", "new"), ([], [{"source": "review"}], "new", "new")))
 
         with (
             mock.patch.object(poller, "now_utc", return_value=base),
@@ -69,7 +69,7 @@ class HeadCycleTests(unittest.TestCase):
         with (
             mock.patch.object(poller, "now_utc", return_value=base),
             mock.patch.object(poller, "get_pr_review_context", side_effect=lambda *_: next(contexts)),
-            mock.patch.object(poller, "collect", return_value=([finding], [finding], "new")) as collect,
+            mock.patch.object(poller, "collect", return_value=([finding], [finding], "new", "new")) as collect,
             mock.patch.object(poller, "sleep_until"),
         ):
             result = poller.poll_with_schedule("owner/repo", 1, [7], 90)
@@ -87,7 +87,7 @@ class HeadCycleTests(unittest.TestCase):
         with (
             mock.patch.object(poller, "now_utc", return_value=base),
             mock.patch.object(poller, "get_pr_review_context", side_effect=lambda *_: next(contexts)),
-            mock.patch.object(poller, "collect", return_value=([finding], [finding], "new")) as collect,
+            mock.patch.object(poller, "collect", return_value=([finding], [finding], "new", "new")) as collect,
             mock.patch.object(poller, "sleep_until"),
         ):
             result = poller.poll_with_schedule("owner/repo", 1, [7], 90)
@@ -102,7 +102,7 @@ class HeadCycleTests(unittest.TestCase):
         base = dt.datetime(2026, 7, 15, 20, 0, tzinfo=dt.timezone.utc)
         contexts = iter(({"head_sha": "old"}, {"head_sha": "new"}))
         review = {"source": "review", "id": 11}
-        collect_results = iter((([], [review], "new"), ([], [review], "new")))
+        collect_results = iter((([], [review], "new", "new"), ([], [review], "new", "new")))
 
         with (
             mock.patch.object(poller, "now_utc", return_value=base),
@@ -121,7 +121,7 @@ class HeadCycleTests(unittest.TestCase):
         base = dt.datetime(2026, 7, 15, 20, 0, tzinfo=dt.timezone.utc)
         contexts = iter(({"head_sha": "old"}, {"head_sha": "new"}))
         approval = {"source": "issue_reaction", "body": "+1"}
-        collect_results = iter((([], [approval], "new"), ([], [], "new")))
+        collect_results = iter((([], [approval], "new", "new"), ([], [], "new", "new")))
 
         with (
             mock.patch.object(poller, "now_utc", return_value=base),
@@ -136,11 +136,46 @@ class HeadCycleTests(unittest.TestCase):
         self.assertEqual("inconclusive_no_codex_review_activity", result["status"])
         self.assertEqual(2, collect.call_count)
 
+    def test_mid_collect_head_change_discards_unbound_clean_signal(self) -> None:
+        base = dt.datetime(2026, 7, 15, 20, 0, tzinfo=dt.timezone.utc)
+        contexts = iter(({"head_sha": "old"}, {"head_sha": "new"}))
+        approval = {"source": "issue_reaction", "body": "+1"}
+        collect_results = iter((([], [approval], "old", "new"), ([], [], "new", "new")))
+
+        with (
+            mock.patch.object(poller, "now_utc", return_value=base),
+            mock.patch.object(poller, "get_pr_review_context", side_effect=lambda *_: next(contexts)),
+            mock.patch.object(poller, "collect", side_effect=lambda *_, **__: next(collect_results)),
+            mock.patch.object(poller, "sleep_until"),
+        ):
+            result = poller.poll_with_schedule("owner/repo", 1, [7], 90)
+
+        self.assertEqual("new", result["head_sha"])
+        self.assertFalse(result["clean_approval_observed"])
+        self.assertEqual("inconclusive_no_codex_review_activity", result["status"])
+
     def test_timeout_does_not_carry_unbound_clean_signal_across_restart(self) -> None:
         base = dt.datetime(2026, 7, 15, 20, 0, tzinfo=dt.timezone.utc)
         contexts = iter(({"head_sha": "old"}, {"head_sha": "new"}))
         approval = {"source": "issue_reaction", "body": "+1"}
-        collect_results = iter((([], [approval], "new"), ([], [], "new")))
+        collect_results = iter((([], [approval], "new", "new"), ([], [], "new", "new")))
+
+        with (
+            mock.patch.object(poller, "now_utc", return_value=base),
+            mock.patch.object(poller, "get_pr_review_context", side_effect=lambda *_: next(contexts)),
+            mock.patch.object(poller, "collect", side_effect=lambda *_, **__: next(collect_results)),
+        ):
+            result = poller.poll_with_timeout("owner/repo", 1, 0, 1, 90)
+
+        self.assertEqual("new", result["head_sha"])
+        self.assertFalse(result["clean_approval_observed"])
+        self.assertEqual("inconclusive_no_codex_review_activity", result["status"])
+
+    def test_timeout_rechecks_mid_collect_head_change_before_clean(self) -> None:
+        base = dt.datetime(2026, 7, 15, 20, 0, tzinfo=dt.timezone.utc)
+        contexts = iter(({"head_sha": "old"}, {"head_sha": "new"}))
+        approval = {"source": "issue_reaction", "body": "+1"}
+        collect_results = iter((([], [approval], "old", "new"), ([], [], "new", "new")))
 
         with (
             mock.patch.object(poller, "now_utc", return_value=base),
@@ -161,7 +196,7 @@ class HeadCycleTests(unittest.TestCase):
         with (
             mock.patch.object(poller, "now_utc", return_value=base),
             mock.patch.object(poller, "get_pr_review_context", side_effect=lambda *_: next(contexts)),
-            mock.patch.object(poller, "collect", return_value=([finding], [finding], "new")),
+            mock.patch.object(poller, "collect", return_value=([finding], [finding], "new", "new")),
         ):
             result = poller.poll_with_timeout("owner/repo", 1, 0, 1, 90)
 
@@ -175,7 +210,7 @@ class HeadCycleTests(unittest.TestCase):
         with (
             mock.patch.object(poller, "now_utc", return_value=base),
             mock.patch.object(poller, "get_pr_review_context", return_value={"head_sha": "head"}),
-            mock.patch.object(poller, "collect", return_value=([], [], "head")),
+            mock.patch.object(poller, "collect", return_value=([], [], "head", "head")),
             mock.patch.object(poller, "sleep_until") as sleep_until,
         ):
             result = poller.poll_with_schedule("owner/repo", 1, [7], 90)
@@ -205,7 +240,7 @@ class UnboundActivityTests(unittest.TestCase):
             ),
             mock.patch.object(poller, "gh_api", side_effect=api),
         ):
-            _, activity, _ = poller.collect(
+            _, activity, _, _ = poller.collect(
                 "owner/repo",
                 1,
                 cycle_started - dt.timedelta(seconds=90),
@@ -235,7 +270,7 @@ class UnboundActivityTests(unittest.TestCase):
             ),
             mock.patch.object(poller, "gh_api", side_effect=api),
         ):
-            _, activity, _ = poller.collect(
+            _, activity, _, _ = poller.collect(
                 "owner/repo",
                 1,
                 restarted_at - dt.timedelta(minutes=7),
