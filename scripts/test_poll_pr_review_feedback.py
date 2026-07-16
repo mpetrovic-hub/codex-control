@@ -154,6 +154,43 @@ class HeadCycleTests(unittest.TestCase):
         self.assertFalse(result["clean_approval_observed"])
         self.assertEqual("inconclusive_no_codex_review_activity", result["status"])
 
+    def test_mid_collect_head_change_keeps_actionable_issue_comment(self) -> None:
+        base = dt.datetime(2026, 7, 15, 20, 0, tzinfo=dt.timezone.utc)
+        contexts = iter(({"head_sha": "old"}, {"head_sha": "new"}))
+        finding = {"source": "issue_comment", "id": 14}
+
+        with (
+            mock.patch.object(poller, "now_utc", return_value=base),
+            mock.patch.object(poller, "get_pr_review_context", side_effect=lambda *_: next(contexts)),
+            mock.patch.object(poller, "collect", return_value=([finding], [finding], "old", "new")),
+            mock.patch.object(poller, "sleep_until"),
+        ):
+            result = poller.poll_with_schedule("owner/repo", 1, [7], 90)
+
+        self.assertEqual("new", result["head_sha"])
+        self.assertEqual([finding], result["findings"])
+        self.assertEqual("actionable_found", result["status"])
+
+    def test_mid_collect_head_change_rechecks_inline_finding_on_new_head(self) -> None:
+        base = dt.datetime(2026, 7, 15, 20, 0, tzinfo=dt.timezone.utc)
+        contexts = iter(({"head_sha": "old"}, {"head_sha": "new"}))
+        old_finding = {"source": "review_comment", "id": 16}
+        collect_results = iter(
+            (([old_finding], [old_finding], "old", "new"), ([], [], "new", "new"))
+        )
+
+        with (
+            mock.patch.object(poller, "now_utc", return_value=base),
+            mock.patch.object(poller, "get_pr_review_context", side_effect=lambda *_: next(contexts)),
+            mock.patch.object(poller, "collect", side_effect=lambda *_, **__: next(collect_results)),
+            mock.patch.object(poller, "sleep_until"),
+        ):
+            result = poller.poll_with_schedule("owner/repo", 1, [7], 90)
+
+        self.assertEqual("new", result["head_sha"])
+        self.assertEqual([], result["findings"])
+        self.assertEqual("inconclusive_no_codex_review_activity", result["status"])
+
     def test_timeout_does_not_carry_unbound_clean_signal_across_restart(self) -> None:
         base = dt.datetime(2026, 7, 15, 20, 0, tzinfo=dt.timezone.utc)
         contexts = iter(({"head_sha": "old"}, {"head_sha": "new"}))
@@ -187,6 +224,22 @@ class HeadCycleTests(unittest.TestCase):
         self.assertEqual("new", result["head_sha"])
         self.assertFalse(result["clean_approval_observed"])
         self.assertEqual("inconclusive_no_codex_review_activity", result["status"])
+
+    def test_timeout_keeps_mid_collect_actionable_issue_comment(self) -> None:
+        base = dt.datetime(2026, 7, 15, 20, 0, tzinfo=dt.timezone.utc)
+        contexts = iter(({"head_sha": "old"}, {"head_sha": "new"}))
+        finding = {"source": "issue_comment", "id": 15}
+
+        with (
+            mock.patch.object(poller, "now_utc", return_value=base),
+            mock.patch.object(poller, "get_pr_review_context", side_effect=lambda *_: next(contexts)),
+            mock.patch.object(poller, "collect", return_value=([finding], [finding], "old", "new")),
+        ):
+            result = poller.poll_with_timeout("owner/repo", 1, 0, 1, 90)
+
+        self.assertEqual("new", result["head_sha"])
+        self.assertEqual([finding], result["findings"])
+        self.assertEqual("actionable_found", result["status"])
 
     def test_timeout_carries_actionable_issue_comment_across_restart(self) -> None:
         base = dt.datetime(2026, 7, 15, 20, 0, tzinfo=dt.timezone.utc)

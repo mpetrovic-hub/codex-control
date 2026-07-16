@@ -454,8 +454,13 @@ def poll_with_schedule(
                 # top-level issue comment, but never carry an unbound clean +1.
                 carried_head_sha = observed_head_sha
                 if head_changed_during_collect:
-                    carried_findings = []
-                    carried_activity = []
+                    unbound_findings = [
+                        item for item in findings if item.get("source") == "issue_comment"
+                    ]
+                    carried_findings, carried_activity = carry_feedback_to_new_head(
+                        unbound_findings,
+                        codex_activity,
+                    )
                 else:
                     carried_findings, carried_activity = carry_feedback_to_new_head(
                         findings,
@@ -577,8 +582,13 @@ def poll_with_timeout(
                 # Preserve actionable feedback, but not an unbound clean +1.
                 carried_head_sha = observed_head_sha
                 if head_changed_during_collect:
-                    carried_findings = []
-                    carried_activity = []
+                    unbound_findings = [
+                        item for item in findings if item.get("source") == "issue_comment"
+                    ]
+                    carried_findings, carried_activity = carry_feedback_to_new_head(
+                        unbound_findings,
+                        codex_activity,
+                    )
                 else:
                     carried_findings, carried_activity = carry_feedback_to_new_head(
                         findings,
