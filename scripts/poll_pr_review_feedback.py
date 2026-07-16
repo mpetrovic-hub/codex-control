@@ -244,7 +244,6 @@ def collect(
     repo: str,
     pr: int,
     since: dt.datetime,
-    unbound_since: dt.datetime | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None]:
     review_context = get_pr_review_context(repo, pr)
     endpoints = (
@@ -259,10 +258,6 @@ def collect(
         for item in gh_api(endpoint) or []:
             created = parse_time(item.get("created_at") or item.get("submitted_at"))
             if created is None or created < since:
-                continue
-            # Issue comments and reactions do not identify a reviewed commit.
-            # Do not let activity from a previous head's cycle cross a restart.
-            if source in {"issue_comment", "issue_reaction"} and unbound_since and created < unbound_since:
                 continue
             if not is_codex_source(item):
                 continue
@@ -351,20 +346,35 @@ def poll_with_schedule(
     since_seconds_ago: float,
 ) -> dict[str, Any]:
     started_at = now_utc()
+    # Keep one observation window across head-cycle restarts. The schedule is
+    # reset per head, but feedback already fetched for the new head must survive.
+    since = started_at - dt.timedelta(seconds=since_seconds_ago)
     head_restarts: list[dict[str, Any]] = []
+    carried_head_sha: str | None = None
+    carried_findings: list[dict[str, Any]] = []
+    carried_activity: list[dict[str, Any]] = []
 
     while True:
         cycle_started_at = now_utc()
         cycle_head_sha = get_pr_review_context(repo, pr).get("head_sha")
         if not cycle_head_sha:
             raise RuntimeError(f"Could not read head SHA for PR #{pr}")
-        since = cycle_started_at - dt.timedelta(seconds=since_seconds_ago)
-        findings: list[dict[str, Any]] = []
-        codex_activity: list[dict[str, Any]] = []
+        if carried_head_sha == cycle_head_sha:
+            findings = carried_findings
+            codex_activity = carried_activity
+        else:
+            findings = []
+            codex_activity = []
+        carried_head_sha = None
+        carried_findings = []
+        carried_activity = []
         last_error: str | None = None
         polls: list[dict[str, Any]] = []
-        clean_approval_observed = False
+        clean_approval_observed = has_clean_approval_signal(codex_activity)
         restart_for_new_head = False
+
+        if findings or clean_approval_observed:
+            break
 
         for minute in schedule_minutes:
             due_at = cycle_started_at + dt.timedelta(minutes=minute)
@@ -376,7 +386,6 @@ def poll_with_schedule(
                     repo,
                     pr,
                     since,
-                    unbound_since=cycle_started_at,
                 )
                 last_error = None
             except Exception as exc:  # noqa: BLE001
@@ -403,6 +412,11 @@ def poll_with_schedule(
                         "new_head_sha": observed_head_sha,
                     }
                 )
+                # collect() used the observed new head for filtering, so carry
+                # its valid results into that head's restarted schedule.
+                carried_head_sha = observed_head_sha
+                carried_findings = findings
+                carried_activity = codex_activity
                 restart_for_new_head = True
                 break
 
@@ -443,21 +457,35 @@ def poll_with_timeout(
     since_seconds_ago: float,
 ) -> dict[str, Any]:
     started_at = now_utc()
+    # Timeout cycles use the same persistent observation window as schedules.
+    since = started_at - dt.timedelta(seconds=since_seconds_ago)
     head_restarts: list[dict[str, Any]] = []
+    carried_head_sha: str | None = None
+    carried_findings: list[dict[str, Any]] = []
+    carried_activity: list[dict[str, Any]] = []
 
     while True:
         cycle_started_at = now_utc()
         cycle_head_sha = get_pr_review_context(repo, pr).get("head_sha")
         if not cycle_head_sha:
             raise RuntimeError(f"Could not read head SHA for PR #{pr}")
-        since = cycle_started_at - dt.timedelta(seconds=since_seconds_ago)
         deadline = cycle_started_at + dt.timedelta(minutes=timeout_minutes)
-        findings: list[dict[str, Any]] = []
-        codex_activity: list[dict[str, Any]] = []
+        if carried_head_sha == cycle_head_sha:
+            findings = carried_findings
+            codex_activity = carried_activity
+        else:
+            findings = []
+            codex_activity = []
+        carried_head_sha = None
+        carried_findings = []
+        carried_activity = []
         last_error: str | None = None
         polls: list[dict[str, Any]] = []
-        clean_approval_observed = False
+        clean_approval_observed = has_clean_approval_signal(codex_activity)
         restart_for_new_head = False
+
+        if findings or clean_approval_observed:
+            break
 
         while now_utc() <= deadline:
             checked_at = now_utc()
@@ -467,7 +495,6 @@ def poll_with_timeout(
                     repo,
                     pr,
                     since,
-                    unbound_since=cycle_started_at,
                 )
                 last_error = None
             except Exception as exc:  # noqa: BLE001
@@ -490,6 +517,10 @@ def poll_with_timeout(
                         "new_head_sha": observed_head_sha,
                     }
                 )
+                # Preserve feedback already filtered against the observed head.
+                carried_head_sha = observed_head_sha
+                carried_findings = findings
+                carried_activity = codex_activity
                 restart_for_new_head = True
                 break
 

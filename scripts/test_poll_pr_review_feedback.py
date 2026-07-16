@@ -44,12 +44,11 @@ class StaleReviewCommentTests(unittest.TestCase):
 class HeadCycleTests(unittest.TestCase):
     def test_schedule_restarts_when_head_changes(self) -> None:
         base = dt.datetime(2026, 7, 15, 20, 0, tzinfo=dt.timezone.utc)
-        times = iter((base, base, base, base, base, base, base, base))
         contexts = iter(({"head_sha": "old"}, {"head_sha": "new"}))
         collect_results = iter((([], [], "new"), ([], [{"source": "review"}], "new")))
 
         with (
-            mock.patch.object(poller, "now_utc", side_effect=lambda: next(times)),
+            mock.patch.object(poller, "now_utc", return_value=base),
             mock.patch.object(poller, "get_pr_review_context", side_effect=lambda *_: next(contexts)),
             mock.patch.object(poller, "collect", side_effect=lambda *_, **__: next(collect_results)),
             mock.patch.object(poller, "sleep_until"),
@@ -62,12 +61,47 @@ class HeadCycleTests(unittest.TestCase):
         self.assertEqual("old", result["head_restarts"][0]["previous_head_sha"])
         self.assertEqual("new", result["head_restarts"][0]["new_head_sha"])
 
-    def test_schedule_is_anchored_to_invocation_cycle(self) -> None:
+    def test_current_head_finding_survives_restart(self) -> None:
         base = dt.datetime(2026, 7, 15, 20, 0, tzinfo=dt.timezone.utc)
-        times = iter((base, base, base, base))
+        contexts = iter(({"head_sha": "old"}, {"head_sha": "new"}))
+        finding = {"source": "review_comment", "id": 10}
 
         with (
-            mock.patch.object(poller, "now_utc", side_effect=lambda: next(times)),
+            mock.patch.object(poller, "now_utc", return_value=base),
+            mock.patch.object(poller, "get_pr_review_context", side_effect=lambda *_: next(contexts)),
+            mock.patch.object(poller, "collect", return_value=([finding], [finding], "new")) as collect,
+            mock.patch.object(poller, "sleep_until"),
+        ):
+            result = poller.poll_with_schedule("owner/repo", 1, [7], 90)
+
+        self.assertEqual("new", result["head_sha"])
+        self.assertEqual([finding], result["findings"])
+        self.assertEqual("actionable_found", result["status"])
+        self.assertEqual(1, collect.call_count)
+
+    def test_current_head_clean_signal_survives_restart(self) -> None:
+        base = dt.datetime(2026, 7, 15, 20, 0, tzinfo=dt.timezone.utc)
+        contexts = iter(({"head_sha": "old"}, {"head_sha": "new"}))
+        approval = {"source": "issue_reaction", "body": "+1"}
+
+        with (
+            mock.patch.object(poller, "now_utc", return_value=base),
+            mock.patch.object(poller, "get_pr_review_context", side_effect=lambda *_: next(contexts)),
+            mock.patch.object(poller, "collect", return_value=([], [approval], "new")) as collect,
+            mock.patch.object(poller, "sleep_until"),
+        ):
+            result = poller.poll_with_schedule("owner/repo", 1, [7], 90)
+
+        self.assertEqual("new", result["head_sha"])
+        self.assertTrue(result["clean_approval_observed"])
+        self.assertEqual("no_actionable_after_observed_codex_review", result["status"])
+        self.assertEqual(1, collect.call_count)
+
+    def test_schedule_is_anchored_to_invocation_cycle(self) -> None:
+        base = dt.datetime(2026, 7, 15, 20, 0, tzinfo=dt.timezone.utc)
+
+        with (
+            mock.patch.object(poller, "now_utc", return_value=base),
             mock.patch.object(poller, "get_pr_review_context", return_value={"head_sha": "head"}),
             mock.patch.object(poller, "collect", return_value=([], [], "head")),
             mock.patch.object(poller, "sleep_until") as sleep_until,
@@ -79,7 +113,7 @@ class HeadCycleTests(unittest.TestCase):
 
 
 class UnboundActivityTests(unittest.TestCase):
-    def test_reaction_from_previous_cycle_is_ignored(self) -> None:
+    def test_reaction_inside_initial_since_grace_is_preserved(self) -> None:
         cycle_started = dt.datetime(2026, 7, 15, 20, 0, tzinfo=dt.timezone.utc)
         reaction = {
             "id": 3,
@@ -103,10 +137,10 @@ class UnboundActivityTests(unittest.TestCase):
                 "owner/repo",
                 1,
                 cycle_started - dt.timedelta(seconds=90),
-                unbound_since=cycle_started,
             )
 
-        self.assertEqual([], activity)
+        self.assertEqual(1, len(activity))
+        self.assertEqual("+1", activity[0]["body"])
 
 
 if __name__ == "__main__":
