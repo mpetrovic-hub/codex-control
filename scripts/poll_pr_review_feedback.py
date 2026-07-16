@@ -200,6 +200,21 @@ def has_clean_approval_signal(codex_activity: list[dict[str, Any]]) -> bool:
     )
 
 
+def carry_feedback_to_new_head(
+    findings: list[dict[str, Any]],
+    codex_activity: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Preserve actionable feedback, but never an unbound clean reaction."""
+    finding_ids = {item.get("id") for item in findings if item.get("id") is not None}
+    carried_activity = [
+        item
+        for item in codex_activity
+        if item.get("source") in {"review", "review_comment"}
+        or (item.get("source") == "issue_comment" and item.get("id") in finding_ids)
+    ]
+    return list(findings), carried_activity
+
+
 def normalize(source: str, item: dict[str, Any]) -> dict[str, Any]:
     user = item.get("user") or {}
     app = item.get("app") or {}
@@ -420,17 +435,13 @@ def poll_with_schedule(
                         "new_head_sha": observed_head_sha,
                     }
                 )
-                # Only commit-bound activity can safely cross a head boundary.
-                # PR-level comments/reactions might belong to the previous head.
+                # Preserve every observed actionable finding, including a
+                # top-level issue comment, but never carry an unbound clean +1.
                 carried_head_sha = observed_head_sha
-                carried_findings = [
-                    item for item in findings if item.get("source") == "review_comment"
-                ]
-                carried_activity = [
-                    item
-                    for item in codex_activity
-                    if item.get("source") in {"review", "review_comment"}
-                ]
+                carried_findings, carried_activity = carry_feedback_to_new_head(
+                    findings,
+                    codex_activity,
+                )
                 unbound_since = detected_at
                 restart_for_new_head = True
                 break
@@ -535,16 +546,12 @@ def poll_with_timeout(
                         "new_head_sha": observed_head_sha,
                     }
                 )
-                # Preserve only feedback with an explicit reviewed commit.
+                # Preserve actionable feedback, but not an unbound clean +1.
                 carried_head_sha = observed_head_sha
-                carried_findings = [
-                    item for item in findings if item.get("source") == "review_comment"
-                ]
-                carried_activity = [
-                    item
-                    for item in codex_activity
-                    if item.get("source") in {"review", "review_comment"}
-                ]
+                carried_findings, carried_activity = carry_feedback_to_new_head(
+                    findings,
+                    codex_activity,
+                )
                 unbound_since = detected_at
                 restart_for_new_head = True
                 break

@@ -79,6 +79,25 @@ class HeadCycleTests(unittest.TestCase):
         self.assertEqual("actionable_found", result["status"])
         self.assertEqual(1, collect.call_count)
 
+    def test_current_head_issue_comment_finding_survives_restart(self) -> None:
+        base = dt.datetime(2026, 7, 15, 20, 0, tzinfo=dt.timezone.utc)
+        contexts = iter(({"head_sha": "old"}, {"head_sha": "new"}))
+        finding = {"source": "issue_comment", "id": 12}
+
+        with (
+            mock.patch.object(poller, "now_utc", return_value=base),
+            mock.patch.object(poller, "get_pr_review_context", side_effect=lambda *_: next(contexts)),
+            mock.patch.object(poller, "collect", return_value=([finding], [finding], "new")) as collect,
+            mock.patch.object(poller, "sleep_until"),
+        ):
+            result = poller.poll_with_schedule("owner/repo", 1, [7], 90)
+
+        self.assertEqual("new", result["head_sha"])
+        self.assertEqual([finding], result["findings"])
+        self.assertEqual([finding], result["codex_activity"])
+        self.assertEqual("actionable_found", result["status"])
+        self.assertEqual(1, collect.call_count)
+
     def test_current_head_review_activity_survives_restart(self) -> None:
         base = dt.datetime(2026, 7, 15, 20, 0, tzinfo=dt.timezone.utc)
         contexts = iter(({"head_sha": "old"}, {"head_sha": "new"}))
@@ -133,6 +152,22 @@ class HeadCycleTests(unittest.TestCase):
         self.assertEqual("new", result["head_sha"])
         self.assertFalse(result["clean_approval_observed"])
         self.assertEqual("inconclusive_no_codex_review_activity", result["status"])
+
+    def test_timeout_carries_actionable_issue_comment_across_restart(self) -> None:
+        base = dt.datetime(2026, 7, 15, 20, 0, tzinfo=dt.timezone.utc)
+        contexts = iter(({"head_sha": "old"}, {"head_sha": "new"}))
+        finding = {"source": "issue_comment", "id": 13}
+
+        with (
+            mock.patch.object(poller, "now_utc", return_value=base),
+            mock.patch.object(poller, "get_pr_review_context", side_effect=lambda *_: next(contexts)),
+            mock.patch.object(poller, "collect", return_value=([finding], [finding], "new")),
+        ):
+            result = poller.poll_with_timeout("owner/repo", 1, 0, 1, 90)
+
+        self.assertEqual("new", result["head_sha"])
+        self.assertEqual([finding], result["findings"])
+        self.assertEqual("actionable_found", result["status"])
 
     def test_schedule_is_anchored_to_invocation_cycle(self) -> None:
         base = dt.datetime(2026, 7, 15, 20, 0, tzinfo=dt.timezone.utc)
